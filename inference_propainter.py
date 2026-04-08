@@ -18,8 +18,32 @@ from utils.download_util import load_file_from_url
 from core.utils import to_tensors
 from model.misc import get_device
 
+import time
 import warnings
 warnings.filterwarnings("ignore")
+
+PROFILE = os.environ.get('PROPAINTER_PROFILE', '0') == '1'
+_t = {}
+_mem = {}
+
+def _tick(name):
+    if PROFILE:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        _t[name] = time.perf_counter()
+
+def _tock(name):
+    if PROFILE:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t[name] = time.perf_counter() - _t[name]
+        if torch.cuda.is_available():
+            _mem[name] = {
+                'peak': torch.cuda.max_memory_allocated() / 1024**3,
+                'current': torch.cuda.memory_allocated() / 1024**3,
+                'reserved': torch.cuda.memory_reserved() / 1024**3
+            }
 
 pretrain_model_url = 'https://github.com/sczhou/ProPainter/releases/download/v0.1.0/'
 
@@ -213,7 +237,9 @@ if __name__ == '__main__':
         '--save_frames', action='store_true', help='Save output frames. Default: False')
     parser.add_argument(
         '--fp16', action='store_true', help='Use fp16 (half precision) during inference. Default: fp32 (single precision).')
-
+    parser.add_argument(
+        '--frames', type=int, default=-1, help='Number of frames to process. Default: -1 (all frames).')
+    
     args = parser.parse_args()
 
     # Use fp16 precision during inference to reduce running memory cost
@@ -221,12 +247,15 @@ if __name__ == '__main__':
     if device == torch.device('cpu'):
         use_half = False
 
+    _tick('data_loading')
     frames, fps, size, video_name = read_frame_from_videos(args.video)
     if not args.width == -1 and not args.height == -1:
         size = (args.width, args.height)
     if not args.resize_ratio == 1.0:
         size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
-
+    
+    if args.frames > 0:
+        frames = frames[:args.frames]
     frames, size, out_size = resize_frames(frames, size)
     
     fps = args.save_fps if fps is None else fps
@@ -265,8 +294,9 @@ if __name__ == '__main__':
     flow_masks = to_tensors()(flow_masks).unsqueeze(0)
     masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
     frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
+    _tock('data_loading')
 
-    
+
     ##############################################
     # set up RAFT and flow competition model
     ##############################################
@@ -299,6 +329,7 @@ if __name__ == '__main__':
     print(f'\nProcessing: {video_name} [{video_length} frames]...')
     with torch.no_grad():
         # ---- compute flow ----
+        _tick('flow_estimation')
         if frames.size(-1) <= 640: 
             short_clip_len = 12
         elif frames.size(-1) <= 720: 
@@ -328,6 +359,7 @@ if __name__ == '__main__':
         else:
             gt_flows_bi = fix_raft(frames, iters=args.raft_iter)
             torch.cuda.empty_cache()
+        _tock('flow_estimation')
 
 
         if use_half:
@@ -338,6 +370,7 @@ if __name__ == '__main__':
 
         
         # ---- complete flow ----
+        _tick('flow_completion')
         flow_length = gt_flows_bi[0].size(1)
         if flow_length > args.subvideo_length:
             pred_flows_f, pred_flows_b = [], []
@@ -366,9 +399,11 @@ if __name__ == '__main__':
             pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
             pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
             torch.cuda.empty_cache()
-            
+        _tock('flow_completion')
+
 
         # ---- image propagation ----
+        _tick('image_propagation')
         masked_frames = frames * (1 - masks_dilated)
         subvideo_length_img_prop = min(100, args.subvideo_length) # ensure a minimum of 100 frames for image propagation
         if video_length > subvideo_length_img_prop:
@@ -402,8 +437,9 @@ if __name__ == '__main__':
             updated_frames = frames * (1 - masks_dilated) + prop_imgs.view(b, t, 3, h, w) * masks_dilated
             updated_masks = updated_local_masks.view(b, t, 1, h, w)
             torch.cuda.empty_cache()
-            
-    
+        _tock('image_propagation')
+
+
     ori_frames = frames_inp
     comp_frames = [None] * video_length
 
@@ -414,6 +450,7 @@ if __name__ == '__main__':
         ref_num = -1
     
     # ---- feature propagation + transformer ----
+    _tick('feat_prop_transformer')
     for f in tqdm(range(0, video_length, neighbor_stride)):
         neighbor_ids = [
             i for i in range(max(0, f - neighbor_stride),
@@ -450,7 +487,33 @@ if __name__ == '__main__':
                 comp_frames[idx] = comp_frames[idx].astype(np.uint8)
         
         torch.cuda.empty_cache()
-                
+    _tock('feat_prop_transformer')
+
+    if PROFILE:
+        stages = [
+            ('Data Loading',              'data_loading'),
+            ('Flow Estimation',           'flow_estimation'),
+            ('Flow Completion',           'flow_completion'),
+            ('Image Propagation',         'image_propagation'),
+            ('Feat Prop + Transformer',   'feat_prop_transformer'),
+        ]
+        print(f'\n[ProPainter Profiling] {video_name} [{video_length} frames]')
+        print(f'{"Stage":<26} {"Time(s)":>8} {"Peak Mem(GB)":>13} {"Current Mem(GB)":>16}')
+        print('─' * 65)
+
+        total_time = 0
+        max_peak_mem = 0
+        for label, key in stages:
+            t = _t.get(key, 0)
+            mem = _mem.get(key, {'peak': 0, 'current': 0})
+            total_time += t
+            max_peak_mem = max(max_peak_mem, mem['peak'])
+            print(f'{label:<26} {t:8.2f} {mem["peak"]:13.2f} {mem["current"]:16.2f}')
+
+        print('─' * 65)
+        final_mem = _mem.get('feat_prop_transformer', {'current': 0})['current']
+        print(f'{"Total":<26} {total_time:8.2f} {max_peak_mem:13.2f} (max) {final_mem:11.2f}')
+
     # save each frame
     if args.save_frames:
         for idx in range(video_length):

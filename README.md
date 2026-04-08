@@ -161,7 +161,7 @@ To test your own videos, please prepare the input `mp4 video` (or `split frames`
 If you want to specify the video resolution for processing or avoid running out of memory, you can set the video size of `--width` and `--height`:
 ```shell
 # process a 576x320 video; set --fp16 to use fp16 (half precision) during inference.
-python inference_propainter.py --video inputs/video_completion/running_car.mp4 --mask inputs/video_completion/mask_square.png --height 320 --width 576 --fp16
+python inference_propainter.py --video inputs/video_completion/running_car.mp4 --mask inputs/video_completion/mask_square.png --height 320 --width 576 --fp16 
 ```
 
 #### 💃🏻 Interactive Demo
