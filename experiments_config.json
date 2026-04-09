@@ -1,0 +1,62 @@
+{
+  "resolution_scaling": {
+    "description": "Test performance at different resolutions",
+    "resolutions": [
+      {"width": 640, "height": 480, "name": "480p"},
+      {"width": 1280, "height": 720, "name": "720p"},
+      {"width": 1920, "height": 1080, "name": "1080p"}
+    ],
+    "frames": 80,
+    "fp16": true,
+    "subvideo_length": 80,
+    "neighbor_length": 10,
+    "ref_stride": 10
+  },
+  "frame_scaling": {
+    "description": "Test performance with different frame counts",
+    "resolution": {"width": 1280, "height": 720},
+    "frame_counts": [40, 80, 120, 160],
+    "fp16": true,
+    "subvideo_length": 80,
+    "neighbor_length": 10,
+    "ref_stride": 10
+  },
+  "parameter_tuning": {
+    "description": "Test impact of different parameters",
+    "resolution": {"width": 1280, "height": 720},
+    "frames": 80,
+    "fp16": true,
+    "experiments": [
+      {
+        "name": "subvideo_length",
+        "values": [40, 80, 120],
+        "neighbor_length": 10,
+        "ref_stride": 10
+      },
+      {
+        "name": "neighbor_length",
+        "values": [5, 10, 15],
+        "subvideo_length": 80,
+        "ref_stride": 10
+      },
+      {
+        "name": "ref_stride",
+        "values": [5, 10, 20],
+        "subvideo_length": 80,
+        "neighbor_length": 10
+      }
+    ]
+  },
+  "ablation_study": {
+    "description": "Analyze contribution of each module",
+    "resolution": {"width": 1280, "height": 720},
+    "frames": 80,
+    "fp16": true,
+    "stages": [
+      "flow_estimation_only",
+      "flow_completion",
+      "image_propagation",
+      "full_pipeline"
+    ]
+  }
+}
