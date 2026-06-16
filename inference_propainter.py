@@ -343,19 +343,32 @@ if __name__ == '__main__':
         "--neighbor_length", type=int, default=10, help='Length of local neighboring frames (transformer temporal receptive field).')
     parser.add_argument(
         # Loop step for the feat-prop/transformer sliding window, decoupled from the
-        # window size. Original behavior = neighbor_length//2 (windows overlap ~50%).
-        # -1 keeps that. A larger stride runs fewer windows (less recompute of the
-        # same frames) WITHOUT changing each window's trained temporal field, so it
-        # speeds up the transformer stage while preserving cross-frame semantics.
-        # Must be <= neighbor_length (else gaps between windows -> unwritten frames);
-        # the loop also forces a final window flush against the video end so the tail
-        # is always covered. Some overlap (stride < neighbor_length) is kept so the
-        # 0.5-average still blends window seams.
-        "--window_stride", type=int, default=-1,
-        help='Sliding-window step for transformer stage (-1 = neighbor_length//2, the original). '
+        # window size. A larger stride runs fewer windows (less recompute of the same
+        # frames) WITHOUT changing each window's trained temporal field, so it speeds
+        # up the transformer stage while preserving cross-frame semantics.
+        # Tuned default = 9 (was the upstream-equivalent neighbor_length//2 = 5).
+        # Sweep at 720p, neighbor_length=10 (so window half-width 5, max stride 10):
+        #   transformer stage  5:4242ms  7:3282  8:3042  9:2756  10:2523 (monotonic).
+        #   PSNR vs upstream stride-5 stays ~41-43 dB and the seam (temporal-jump)
+        #   metric is unchanged for stride 8/9/10 on two clips (bmx-trees, tennis),
+        #   no unwritten frames. 9 takes ~35% off the stage while keeping a 2-frame
+        #   window overlap for seam-blend margin; 10 is ~41% but overlaps only 1
+        #   frame. Pass -1 to restore the exact upstream step (neighbor_length//2).
+        # HARD CAP: stride must be <= neighbor_length, else adjacent windows leave
+        # gaps -> frames in no window -> uninitialized-memory garbage. To stride
+        # wider you must also widen neighbor_length (which costs more attention
+        # compute and changes semantics), so >neighbor_length is never a free win.
+        "--window_stride", type=int, default=9,
+        help='Sliding-window step for transformer stage (-1 = neighbor_length//2, upstream). '
              'Larger = faster, fewer windows; must be <= neighbor_length.')
     parser.add_argument(
-        "--subvideo_length", type=int, default=60, help='Length of sub-video for long video inference.')
+        # 80 = upstream ProPainter default (the fork had silently lowered it to 60).
+        # Drives three things: flow-completion chunk size, image-prop chunk size
+        # (bit-exact, padded), AND ref_num = subvideo_length // ref_stride — the
+        # number of global reference frames per transformer window. The third is the
+        # real cost lever: more refs = more attention compute (80 is ~11% slower in
+        # the transformer stage than 60 at 720p/80f) but more temporal context.
+        "--subvideo_length", type=int, default=80, help='Length of sub-video for long video inference.')
     parser.add_argument(
         "--raft_iter", type=int, default=20, help='Iterations for RAFT inference.')
     parser.add_argument(
