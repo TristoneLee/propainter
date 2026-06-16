@@ -46,8 +46,9 @@ CELLS = {
 STAGES = ['data_loading', 'flow_estimation', 'flow_completion',
           'image_propagation', 'feat_prop_transformer', 'output_write']
 
-SUBVIDEO = 60     # fork production default, applied to both variants
-NEIGHBOR = 8
+SUBVIDEO = 80     # upstream ProPainter default, applied to both variants
+NEIGHBOR = 10     # upstream default (transformer temporal receptive field)
+WINDOW_STRIDE = 9 # fork default sliding-window step (optimized variant only)
 
 
 def build_cmd(variant, label, json_out, out_dir, stage_mode):
@@ -68,7 +69,8 @@ def build_cmd(variant, label, json_out, out_dir, stage_mode):
                 '-i', os.path.join(src, 'input.mp4'),
                 '-m', os.path.join(src, 'masks.mp4'),
                 '--height', str(h), '--width', str(w), '--frames', str(n),
-                '--fp16', *chunk, '--output', out_dir, '--bench_json', json_out]
+                '--fp16', *chunk, '--window_stride', str(WINDOW_STRIDE),
+                '--output', out_dir, '--bench_json', json_out]
         return argv, _REPO, env
     elif variant == 'original':
         env.pop('PROPAINTER_FAST', None)
@@ -167,8 +169,9 @@ def write_report(results, path):
              'for the fork; `ProPainter/inference_propainter.py`, pristine model '
              'code, for the original). Protocol: 1 warmup (full pipeline incl. '
              'video read + write, discarded) + N timed runs per cell, fresh '
-             'subprocess each. Chunking (both): `subvideo_length=60`, '
-             '`neighbor_length=8`. Optimized = `PROPAINTER_FAST=1` + fp16.')
+             'subprocess each. Chunking (both): `subvideo_length=80`, '
+             '`neighbor_length=10` (upstream defaults). Optimized = '
+             '`PROPAINTER_FAST=1` + fp16 + `window_stride=9`.')
     L.append('')
     L.append('**TOTAL (pure)** = zero-added-synchronize wall from data_loading '
              'start to output_write end (the full per-video pipeline; model load '
