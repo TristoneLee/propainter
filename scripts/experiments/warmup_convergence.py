@@ -18,6 +18,7 @@ import json
 import os
 import statistics
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bench.run_benchmark import run_once, CELLS  # noqa: E402
@@ -29,6 +30,10 @@ def main():
     ap.add_argument('--cell', default='720p80', choices=list(CELLS))
     ap.add_argument('--variant', default='optimized', choices=['optimized', 'original'])
     ap.add_argument('--runs', type=int, default=12)
+    ap.add_argument('--settle', type=float, default=0.0,
+                    help='seconds to wait between runs so the dying subprocess fully '
+                         'releases GPU memory before the next allocates (avoids a '
+                         'cross-process free/alloc race that can OOM near the card limit)')
     ap.add_argument('--out', default=None)
     args = ap.parse_args()
 
@@ -42,6 +47,8 @@ def main():
         series.append(t)
         print(f'    run {i + 1:2d}: total_pure_s = {t:.3f}s' if t else
               f'    run {i + 1:2d}: FAIL', flush=True)
+        if args.settle and i < args.runs - 1:
+            time.sleep(args.settle)
 
     vals = [t for t in series if t]
     print('\n--- summary ---', flush=True)

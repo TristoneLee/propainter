@@ -334,7 +334,15 @@ if __name__ == '__main__':
     parser.add_argument(
         "--ref_stride", type=int, default=10, help='Stride of global reference frames.')
     parser.add_argument(
-        "--neighbor_length", type=int, default=8, help='Length of local neighboring frames.')
+        # 10 matches the training setting — keep the default faithful to how the
+        # model was trained rather than tuned for a benchmark shape. For pure
+        # throughput, larger windows help up to a point: measured 720p/200f fp16,
+        # the transformer cost vs window size is a U-curve (TOTAL 22.6s @20, 22.4s
+        # @24, back up to 24.5s @30, OOM @40), and the whole-run memory peak is set
+        # by flow_estimation (~31.4 GB), not the window, for any length <= 30. So a
+        # deployment that prioritizes speed over train-time fidelity can pass
+        # --neighbor_length 24, but the default stays at the trained value.
+        "--neighbor_length", type=int, default=10, help='Length of local neighboring frames.')
     parser.add_argument(
         "--subvideo_length", type=int, default=60, help='Length of sub-video for long video inference.')
     parser.add_argument(
@@ -529,15 +537,14 @@ if __name__ == '__main__':
     with torch.no_grad():
         # ---- compute flow ----
         _tick('flow_estimation')
-        if frames.size(-1) <= 640: 
-            short_clip_len = 96
-        elif frames.size(-1) <= 720: 
-            short_clip_len = 64
-        elif frames.size(-1) <= 1280:
-            short_clip_len = 64
-        else:
-            short_clip_len = 64
-        
+        # Chunk RAFT over long videos to bound flow-estimation memory. The only
+        # distinction that matters is width <= 640 (narrow → 96-frame clips fit)
+        # vs wider (→ 64). The old >720 / >1280 / else branches all returned 64.
+        # 64 is the max that fits at 720p/200f on a 32 GB card: RAFT's correlation
+        # activations grow ~linearly with clip length, and flow_estimation is itself
+        # a peak point (~24.5 GB allocated at clip=64); clip=80 OOMs. Do not raise.
+        short_clip_len = 96 if frames.size(-1) <= 640 else 64
+
         if frames.size(1) > short_clip_len:
             gt_flows_f_list, gt_flows_b_list = [], []
             for f in range(0, video_length, short_clip_len):
@@ -549,7 +556,6 @@ if __name__ == '__main__':
                 
                 gt_flows_f_list.append(flows_f)
                 gt_flows_b_list.append(flows_b)
-                torch.cuda.empty_cache()
                 
             gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
             gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
