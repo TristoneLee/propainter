@@ -1,0 +1,14 @@
+av
+addict
+einops
+future
+numpy
+scipy
+opencv-python
+matplotlib
+scikit-image
+imageio-ffmpeg
+pyyaml
+requests
+timm
+yapf

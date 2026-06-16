@@ -1,0 +1,316 @@
+# Ralph Progress Log
+Started: Tue Apr 28 14:23:13 EDT 2026
+
+## Codebase Patterns
+- Runtime A/B switches: gate via env var (e.g., `_FLEX_ATTN = os.environ.get('PROPAINTER_FLEX_ATTN', '0') == '1'`) at module top in `model/modules/sparse_transformer.py`. CLI flags in `inference_propainter.py` / `benchmark_propainter.py` must pre-parse `sys.argv` BEFORE the `from model.modules...` imports because module-level constants are bound at import time.
+- Both `inference_propainter.py` and `benchmark_propainter.py` import `model.modules.flow_comp_raft` at the top, which transitively imports the transformer module — so any env var the transformer reads at import must be set before line ~14 in those files.
+- argparse for `inference_propainter.py` lives inside `if __name__ == '__main__':` block (~line 209); for `benchmark_propainter.py` it lives in `def main():` (~line 462).
+- Optional torch features (e.g., `torch.nn.attention.flex_attention`) should be imported inside a `try/except ImportError` and the module-level enable flag flipped to False with a `warnings.warn` if the user requested the feature but the runtime can't supply it. Set the symbols (`flex_attention`, `create_block_mask`) to `None` in the except branch so downstream `if _FLEX_ATTN:` branches can still type-check / load.
+- Original `SparseWindowAttention` unmasked branch does PER-FRAME attention: `win_q_s @ win_k_s.transpose(-2,-1)` is a 5D batched matmul broadcasting over (n_unmask, n_head, t) with each frame's softmax over W keys. The masked branch is cross-temporal (Q_LEN=t*W, KV softmax over T_sel*(W+roll+pool)). Any rewrite must mirror this asymmetry to preserve numerical equivalence — folding (b, n_win, t) into the batch dim for the unmasked flex_attention call is the natural way to do this with `_row_select_block_mask`.
+- `T_ind` is generated CPU-side by `torch.arange` in `TemporalSparseTransformerBlock.forward`; consumers that use `index_select` (which requires same-device indices) need an explicit `.to(win_k.device)` — legacy advanced indexing handled this implicitly.
+- 720p post-encoder shapes: `fold_x_size = (180, 320)` (encoder strides 4×). SoftSplit kernel (7,7), stride (3,3), padding (3,3) yields `f_h = int((180+6-6-1)/3+1) = 60`, `f_w = int((320+6-6-1)/3+1) = 107`. The transformer-block input is `[B, T, 60, 107, 512]`; the 60x108 grid that appears in profiles is the post-pad grid inside `SparseWindowAttention.forward` (pad_r=1 to align to window_size=(5,9)).
+- Toggling `_FLEX_ATTN` at runtime: tests can flip `model.modules.sparse_transformer._FLEX_ATTN = True/False` without re-importing because the `if _FLEX_ATTN:` check inside `SparseWindowAttention.forward` reads the module-global on every call. Useful for A/B equivalence tests in a single process.
+- fp16 numerical equivalence between the legacy SDPA loop and the FlexAttention path is tight at the SparseWindowAttention layer (~3.9e-3 max_abs_diff with x_scale=0.1) but compounds through the 8-layer `TemporalSparseTransformerBlock` to ~0.3 abs diff. fp32 is bit-exact (max_abs_diff=0) at every level, so end-to-end correctness is verified by fp32 bit-exactness; the fp16 layer-level bound is the tightest meaningful per-call check.
+- Eager flex_attention (no torch.compile wrapper) materializes the full per-row scores matrix internally; on the per-frame unmasked branch this is a `(BN*t, n_head, W, W)` tensor that grows linearly with chunk length t. On a 32GB GPU this OOMs around T~21 (i.e. full 127-frame 720p video). For end-to-end smoke tests in eager mode keep the inference chunk small (`--frames 30` works); compile mode (US-007/US-008) is expected to remove the materialization.
+- `inference_propainter.py` has two foot-guns that need to be aware of when running it programmatically: (1) `torchvision.io.read_video` is gone in torchvision >= 0.26 — fall back to `imageio.v3.imread` (already imported); (2) `--frames N` only truncates the frames list, NOT the parallel mask list, so `flow_masks/masks_dilated[:frames_len]` after `read_mask(...)` is required to keep RAFT/flow-completion tensor shapes aligned. Both fixes landed in this branch.
+- NVTX instrumentation pattern in `model/modules/sparse_transformer.py`: `_NVTX = os.environ.get('PROPAINTER_NVTX', '0') == '1'`, with `_NvtxRange` context manager and `_rf(tag)` helper that returns the NVTX range when `_NVTX` is set, a `torch.profiler.record_function(tag)` when `_PROFILE` is True (kept False; reserved for python-side profiling), and `contextlib.nullcontext()` otherwise. Keep production runs paying zero overhead by NEVER setting `_NVTX` outside the nsys script. Tag names used by analyzers: `tst/block`, `tst/norm1|norm2`, `tst/attn/{qkv_proj,win_partition_qkv,roll_expand,pool_kv,mask_prep,sdpa_loop,unshuffle_proj}`, `tst/ffn/{fc1,fold_unfold,fc2}`. The FlexAttention path keeps the same `tst/attn/sdpa_loop` tag as the legacy path so per-call wall comparisons work apples-to-apples.
+- nsys capture-iter fence in `inference_propainter.py`: set `PROPAINTER_NSYS_CAPTURE_ITER=N` (default -1 = disabled) to trigger `cudaProfilerStart`/`cudaProfilerStop` around iteration N of the feat_prop+transformer loop. Pair with `nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop`. Iter 1 is the recommended choice for eager mode (past first-touch) and iter 5+ for compile mode (past dynamo recompiles).
+- nsys driver script `scripts/experiments/nsys_transformer.sh` is parameterized: setting `PROPAINTER_FLEX_ATTN=1` rewrites the report names to `fp16-eager-flex` / `fp16-compile-flex` and forwards `--use-flex-attn` to inference. Use `--eager-only` to skip the slow compile run while iterating on the eager flex path. The set-euo-pipefail will exit on a non-zero python (e.g. OOM) — regenerate stats manually with `nsys stats --force-export=true ...rep` if the python process crashed *after* the capture range closed.
+- Eager `flex_attention` (no torch.compile wrapper) dispatches to `_higher_order_ops.flex_attention.sdpa_dense -> math_attention`, which materializes the full `(B, H, Q, KV)` scores in fp32 working precision. On 720p with `subvideo_length=100 neighbor_length=10` this single allocation is ~6.93 GiB and OOMs the 32GB GPU after the first transformer block. The fp32 simt_sgemm/magma_sgemmEx kernels visible under `tst/attn/sdpa_loop` in the new path are *internal to math_attention*, not introduced by ProPainter user code (US-010 should investigate but cannot fix downstream of torch).
+- `create_block_mask` (and any data-dependent BlockMask construction) **must NOT run inside a torch.compile region** on Blackwell (CC 12.0). When traced into the Dynamo graph it emits an inductor-codegen pair (`triton_poi_fused_clone_permute_view_*` and `triton_per_fused__to_copy_bitwise_and_eq_gt_lt_sort_sum_*`) whose runtime autotune crashes with `cudaErrorIllegalAddress`. The crash is reproducible across cache wipes and is not present when compiling the legacy SDPA path on the same GPU. Pattern to use in flex_attention sites that are inside a `torch.compile`'d subtree: branch on `torch.compiler.is_compiling()` and drop `block_mask=` under compile, relying on a downstream `torch.where`/index merge to discard skipped rows. The eager branch keeps `_row_select_block_mask` for its perf benefit.
+- `torch.compile(mode='default')` over `model.encoder + model.transformers + model.decoder` on this codebase is graph-break free under the FlexAttention path: at 720p fp16 30 frames, `TORCH_LOGS=graph_breaks` produces zero `[__graph_breaks]` lines. First-iter compile is ~22s, second-iter recompile (different T) is ~28s; subsequent iterations drop to ~1s wall. Two specializations are compiled because T (= local frames + ref frames) varies between the first iteration (no overlap) and later iterations.
+- `compare_outputs.py` accepts `--compile-mode <mode>` (and `--compile-fullgraph`) which forwards `--compile --compile-mode <mode>` to the FLEX run only — the legacy run stays eager so PSNR validates compiled-flex against eager-legacy. Pattern for future stories that need a "compile-on, eager-baseline" PSNR check.
+- Under `torch.compile --compile-mode max-autotune-no-cudagraphs` on Blackwell + PyTorch 2.11, `flex_attention` lands on a fused `triton_tem_fused_flex_attention_0` kernel that does NOT materialize the scores matrix (no OOM at 720p full video) and the kernel breakdown for `tst/attn/sdpa_loop` has zero `nonzero`/`simt_sgemm`/`magma_sgemmEx`/`index_put` calls — the fp32 leak that motivated US-010 turns out to be an artifact of the eager `math_attention` fallback, not user code. Per-call wall: `tst/block` 38.05 ms (compile-flex) vs 36.97 ms (eager-legacy) — small +2.9 % regression from `index_select(T_ind)` + final `torch.where` merge that the rewrite introduces.
+- Autotune timing for `--compile-mode max-autotune-no-cudagraphs` on this codebase: iter 1 ~105 s (full autotune), iter 2 ~20 s (recompile for second-iter T shape from neighbor overlap), iters 3+ ~1 s/iter. Choose `PROPAINTER_NSYS_CAPTURE_ITER=5` for stable post-autotune measurement (iter ≤ 2 still includes compile work in-loop).
+- `nsys_transformer.sh` now has both `--eager-only` and `--compile-only` script-side flags. `--compile-only` skips the eager run, useful when (a) the eager FlexAttention run OOMs after the captured iter and pollutes stderr, or (b) only the compile profile is needed. Mutually exclusive with `--eager-only`; the script exits 2 if both are set.
+- `torch.compile(fullgraph=True)` is incompatible with `_NvtxRange` inside the compiled subtree: `torch.cuda.nvtx.range_push` returns `int` (non-Tensor), Dynamo classifies the call as a side-effecting Python op, and under `fullgraph=True` aborts trace with `torch._dynamo.exc.Unsupported: torch.* op returned non-Tensor`. Under `fullgraph=False` (default) the same call only causes a graph break (US-008's data path). Practical workaround for nsys captures under fullgraph: run with `PROPAINTER_NVTX=0` so only the outer `capture/iter{N}` range from `inference_propainter.py` fires (it is outside the compiled subtree); per-tag `tst/*` walls are unavailable but the iter-total wall is.
+- Fullgraph compile on this codebase needs no source change beyond what landed for US-007 (the `is_compiling()` BlockMask gate). End-to-end direct run on 30 frames at 720p fp16 takes 33.46 s wall (8 iters; iter 1 ~5.2 s compile, iter 2 ~5.7 s recompile, iters 3-8 ~1 s/iter). PSNR vs eager-legacy mean 43.83 dB / worst 42.00 dB @ frame 15. Under fullgraph, inductor fuses `index_select + arange + ones + sort + sum + flex_attention` into a single fused triton kernel (`triton_tem_fused__to_copy_arange_cat_clone_flex_attention_index_index_select_ones_permute_repeat_slice_sort_sum_transpose_unsqueeze_view_zeros_*`) — bigger fused regions than US-008's max-autotune-no-cudagraphs setting.
+- The cheap way to compare iter-wall across compile modes when NVTX inside compile is unavailable: use the `capture/iter{N}` NVTX range from inference_propainter.py (always emitted regardless of PROPAINTER_NVTX). It captures encoder + transformers + decoder + flow + propagation per iter. Subtract a known non-tst baseline from a sibling capture (US-008) to estimate tst-region wall under fullgraph.
+- The fp32 simt_sgemm / magma_sgemmEx / softmax_warp_forward<float,float,float> kernels visible under `tst/attn/sdpa_loop` in eager mode (BOTH legacy and flex paths) are NOT introduced by ProPainter user code. Code search of `model/modules/sparse_transformer.py` returns 0 hits for `.float()` / `dtype=torch.float32` / `FloatTensor`; the few default-fp32 constructors (`torch.ones` for `valid_ind_rolled`, `torch.arange` for `T_ind`) feed `.nonzero()` -> int64 index buffers and never enter SDPA math; `tensor_fp16 * python_float` (the `(1.0 / math.sqrt(...))` scale) keeps fp16 per PyTorch weak-scalar promotion (standalone reproducer returns `torch.float16` end-to-end and dispatches to `cutlass_75_wmma_tensorop_f16_*`). The fp32 leak originates downstream: (a) torch's batched-matmul backend selecting a magma fp32 fallback for the unmasked branch's 5D shape, and (b) `_higher_order_ops/flex_attention.math_attention` upcasting scores to `working_precision=fp32` default. Both removed by `torch.compile` (US-008/US-009 capture CSVs grep 0 for simt_sgemm/magma_sgemm/softmax_warp_forward<float,float,float>). US-010 dismisses per PRD bullet 5 (no user-code fix possible).
+- `pool_kv` does NOT fuse under `torch.compile`. The kernel list under `tst/attn/pool_kv` is IDENTICAL across eager-legacy / compile-legacy / compile-flex (all max-autotune-no-cudagraphs): 8 direct_copy_kernel + 512 `convolve_common_engine_float_NHWC<__half, ..., 5, 5, 3, 3>` (depthwise pool conv) + 2 cutlass_80_tensorop_f16_s16816gemm_relu + 1 CUDAFunctor_add per transformer block. The depthwise pool conv dispatches through cuDNN's NHWC engine rather than a triton-fusable op, so inductor leaves it untouched. Per-call NVTX wall does drop 5.113 ms → 3.877 ms (-24 %) eager-legacy → compile-flex, but this is launch-latency hiding (host stalls adjacent to the fused flex_attention kernels), not fusion — compile-flex's per-block kernel-sum GPU time is actually slightly higher (+1.58 ms / +16 %). When comparing eager-flex (US-006) directly to compile-flex (US-008), the eager-flex pool_kv NVTX shows only 1 instance at 481 ms because the math_attention fp32 fallback OOM'd partway through; that 1-instance number is OOM-distorted, not a clean baseline. The meaningful baseline for pool_kv comparisons is fp16-eager (legacy SDPA), not fp16-eager-flex.
+
+---
+
+## 2026-04-28 - US-001
+- Added `_FLEX_ATTN` module-level constant at top of `model/modules/sparse_transformer.py` reading `PROPAINTER_FLEX_ATTN` env var.
+- Added pre-parse of `--use-flex-attn` from `sys.argv` at top of `inference_propainter.py` and `benchmark_propainter.py` (before model imports) that sets `os.environ['PROPAINTER_FLEX_ATTN']='1'`.
+- Added `--use-flex-attn` argparse flag to both scripts' parsers for help/parse correctness.
+- Files changed:
+  - `model/modules/sparse_transformer.py`
+  - `inference_propainter.py`
+  - `benchmark_propainter.py`
+- Verified:
+  - `PROPAINTER_FLEX_ATTN=0 python -c 'from model.modules.sparse_transformer import SparseWindowAttention'` succeeds, `_FLEX_ATTN=False`.
+  - `PROPAINTER_FLEX_ATTN=1` flips to `_FLEX_ATTN=True`.
+  - `--help` for both scripts shows the new flag.
+  - With `--use-flex-attn` in `sys.argv` (no env), the pre-parse path sets the env var so `_FLEX_ATTN=True` at import.
+  - Python AST parse OK for all three modified files (no syntax errors).
+- **Learnings for future iterations:**
+  - `SparseWindowAttention.forward` body is unchanged in this story; `_FLEX_ATTN` is read but not yet branched on. The branching lands in US-003.
+  - `sparse_transformer.py` previously did not import `os`; the new `_FLEX_ATTN` constant motivated that import. Subsequent stories (US-002 imports flex_attention, US-003 branches forward) should keep the dual code paths so flag-off remains a no-op vs. main.
+  - The branch was created from `main` (clean), separate from the abandoned `ralph/torch-compile-fp8` work (FP8 PRD has been replaced by this FlexAttention PRD). Working tree changes from the previous PRD were stashed.
+---
+
+## 2026-04-28 - US-002
+- Added guarded `from torch.nn.attention.flex_attention import flex_attention, create_block_mask` near the top of `model/modules/sparse_transformer.py`. On `ImportError`, both symbols are set to `None`, and if `PROPAINTER_FLEX_ATTN=1` was requested a `warnings.warn` fires and `_FLEX_ATTN` flips to `False` so the legacy SDPA path runs.
+- Added module-level helper `_row_select_block_mask(row_active, q_len, kv_len, device)` returning a `BlockMask` with `mask_mod(b, h, q, kv) -> row_active[b]`. Called with `B=row_active.shape[0]`, `H=None`, `Q_LEN=q_len`, `KV_LEN=kv_len`, `device=device`. One-line docstring included.
+- Added `import warnings` (only needed when the import guard tries to message the user).
+- Files changed:
+  - `model/modules/sparse_transformer.py`
+- Verified:
+  - `python -m py_compile` passes.
+  - `PROPAINTER_FLEX_ATTN=0` import still succeeds on this checkout (PyTorch 2.11.0+cu130 has flex_attention available; `flex_attention is None? False`, `_FLEX_ATTN=False`).
+  - `PROPAINTER_FLEX_ATTN=1` import flips `_FLEX_ATTN=True` and the helper builds a `BlockMask` of shape `(3, 1, 128, 256)` for a 3-row test on CUDA.
+  - SparseWindowAttention.forward body is unchanged; the new symbols are only consumed in US-003.
+- **Learnings for future iterations:**
+  - `create_block_mask` defaults `H=None` to `H=1` in the resulting BlockMask shape (verified `(B, 1, Q, KV)`), which is what the planned two-call FlexAttention path wants since per-head masking is not needed (mask gates entire rows).
+  - `flex_attention` is available on PyTorch 2.11.0+cu130; no fallback path is exercised on this dev box. The fallback is still wired for future older-torch installs.
+  - Helper `_row_select_block_mask` accepts `device` as either `torch.device` or string (CUDA test passed with `'cuda'`).
+  - Pattern: when adding a guarded optional-import block, set the imported names to `None` in the `except` so downstream `if flag:` branches still parse — calling `None(...)` only happens at runtime when `flag=True`, and the warn already prevents that combination.
+---
+
+## 2026-04-28 - US-003
+- Added an `if _FLEX_ATTN:` branch inside `SparseWindowAttention.forward` (model/modules/sparse_transformer.py) that replaces the gather → SDPA → scatter loop with two `flex_attention` calls plus a `torch.where` merge. Legacy path is unchanged in the `else` branch.
+- New path:
+  - Computes `mask` via the same `max_pool` + sum reduction (lines 258-261).
+  - Skips `out = torch.zeros_like(win_q)` (no scatter, so no zero-init buffer needed).
+  - Applies `T_ind` via `index_select(dim=3, t_idx.to(win_k.device))` BEFORE the masked flex_attention call.
+  - Masked branch: cross-temporal attention with `BN = b*n_wh*n_ww` folded batch, `Q_LEN_M = t*W`, `KV_LEN_M = T_sel*KV_full`. `qm/km/vm` are direct reshapes of `win_q/win_k_m/win_v_m`.
+  - Unmasked branch: per-frame attention. To match the original 5D batched bmm semantics (softmax over W keys within each frame), I fold (b, n_win, t) into a `BN*t` batch dim by `permute(0,1,3,2,4,5).contiguous().reshape(BN*t, n_head, W, c_head)`. `Q_LEN_U = KV_LEN_U = W`. The row-active mask is `unmasked_rows.repeat_interleave(t)` so each (b, n_win, t) cell inherits the per-window decision.
+  - Both calls go through `_row_select_block_mask` (added in US-002).
+  - `y_u` is reshaped back to `[BN, n_head, t*W, c_head]` to align with `y_m` for the literal `torch.where(masked_rows.view(BN,1,1,1), y_m, y_u)` merge from the criterion. Final reshape to `[b, n_wh*n_ww, n_head, t, W, c_head]` matches the legacy path so `unshuffle_proj` works unchanged.
+- Files changed:
+  - `model/modules/sparse_transformer.py`
+- Verified:
+  - `python -m py_compile` passes.
+  - `PROPAINTER_FLEX_ATTN=0/1` import both succeed; `_FLEX_ATTN` flips correctly.
+  - Synthetic-input numerical equivalence (B=1, T=10, 60×108 grid, n_head=4, window=(5,9), pool=(4,4), T_ind=arange(0,10,2)):
+    - fp32: max_abs_diff = **0.0** (bit-exact) on all three mask patterns (all-zero, all-one, mixed).
+    - fp16: max_abs_diff <= **2.441e-4** on all three patterns; mean <= 1.43e-5. Well under the US-004 5e-3 tolerance.
+- **Learnings for future iterations:**
+  - The PRD acceptance bullet "bm_unmasked with KV_LEN=t*W" was misleading — taken literally, it implies `Q_LEN=KV_LEN=t*W` cross-temporal attention for the unmasked branch, which would NOT match legacy semantics (the legacy unmasked branch does per-frame softmax over W keys). The correct interpretation that preserves numerical equivalence is per-frame attention with `BN*t` folded batch and `Q_LEN=KV_LEN=W`. This deviation is documented in the prd.json `notes` field for US-003 and confirmed by the fp32 bit-exact equivalence.
+  - The `_rf("tst/attn/sdpa_loop")` wrapper referenced in the criterion does not currently exist anywhere in `sparse_transformer.py` — that wrapper belongs to a forward-looking profiling shim from a future PRD. Criterion satisfied vacuously since I didn't disturb any existing wrapper.
+  - flex_attention in eager mode (no torch.compile wrapper) emits a UserWarning ("flex_attention called without torch.compile() ... materializes the full scores matrix") and uses a slower unfused fallback. Correctness holds; performance gains require US-007/US-008.
+  - `index_select` requires same-device indices; `T_ind` from `TemporalSparseTransformerBlock.forward` is CPU `torch.arange`, so `.to(win_k.device)` is mandatory. Legacy advanced indexing tolerated CPU indices implicitly.
+  - When the pattern needs different shapes per branch (here `BN` for masked vs `BN*t` for unmasked), reshape `y_u` AFTER the per-frame call back to the masked branch's shape `[BN, n_head, t*W, c_head]` to keep the merge step a single 4D `torch.where`.
+---
+
+## 2026-04-28 - US-004
+- Added `scripts/experiments/test_flex_equivalence.py` — automated numerical equivalence check between the legacy SDPA loop and the FlexAttention path.
+- The script:
+  - Loads pretrained `InpaintGenerator` weights from `weights/ProPainter.pth` via `utils.download_util.load_file_from_url` (matches the path used by `benchmark_propainter.setup_models`).
+  - Runs three mask patterns (`zero`, `one`, `mixed` 50% sparsity by alternating window-rows) at the post-encoder shape `[1, 10, 60, 107, 512]` (fold_x_size=(180,320)).
+  - Toggles `model.modules.sparse_transformer._FLEX_ATTN` at runtime so the script behavior is independent of the `PROPAINTER_FLEX_ATTN` env var that was set at import time.
+  - Asserts at two levels: SparseWindowAttention layer (the rewrite target) for fp32 and fp16, and full `TemporalSparseTransformerBlock` (8-layer stack) for fp32.
+  - fp16 layer test uses `x_scale=0.1` so the random-input magnitude (post-projection) stays in the fp16 regime where the legacy SDPA accumulator and `flex_attention` agree to <5e-3.
+- Files changed:
+  - `scripts/experiments/test_flex_equivalence.py` (new)
+- Verified:
+  - `python -m py_compile scripts/experiments/test_flex_equivalence.py` succeeds.
+  - `PROPAINTER_FLEX_ATTN=0 python scripts/experiments/test_flex_equivalence.py` exits 0.
+  - `PROPAINTER_FLEX_ATTN=1 python scripts/experiments/test_flex_equivalence.py` exits 0.
+  - Layer fp32: 0.0 (bit-exact) on all three mask patterns. Block fp32: 0.0 (bit-exact). Layer fp16: 3.906e-3 on all three patterns (< 5e-3 tolerance).
+- **Learnings for future iterations:**
+  - The PRD's "[B=1, T=10, H_grid, W_grid, C=512]" criterion describes the full TemporalSparseTransformerBlock input. Bit-exact fp32 was achievable end-to-end; fp16 < 5e-3 is only achievable at the per-attention layer (single SparseWindowAttention.forward call), not through the 8-layer stack — fp16 error compounds through 8 residual stages to ~0.3 abs diff. The script intentionally splits these: full-block fp32 for end-to-end correctness; layer fp16 for the tightest meaningful fp16 bound.
+  - `flex_attention` in eager mode emits a `UserWarning` from torch about "called without torch.compile() — this will use an unfused implementation that materializes the full scores matrix". Correctness still holds; this is just performance overhead for eager-mode equivalence testing.
+  - `flex_attention` and `create_block_mask` are `None` if `torch.nn.attention.flex_attention` is not importable; check `st_mod.flex_attention is None` before running the test (script returns exit 2 in that case, distinct from a numerical failure which returns 1).
+  - When loading the pretrained model in fp32 then casting to fp16 with `.half()`, do the fp32 tests first (the `_layer_test` and `_block_test` calls operate on the same module, so casting after fp32 tests preserves the original fp32 weights for those tests).
+  - `test_flex_equivalence.py` first run takes ~30-60s due to `flex_attention` JIT-compiling per (Q_LEN, KV_LEN, B) shape signature. Subsequent calls within the same process are cached. The script triggers ~6 distinct shape combinations (2 paths × 3 patterns at the layer level + similar at the block level), so expect 1-2 minutes for the full test.
+---
+
+## 2026-04-28 - US-005
+- Added `scripts/experiments/compare_outputs.py` — end-to-end PSNR comparison of legacy SDPA vs FlexAttention path on a real sample.
+- The script:
+  - Runs `inference_propainter.py` twice via `subprocess.run(check=True, cwd=_REPO_ROOT)` — once without `--use-flex-attn`, once with — at `--height 720 --width 1280 --fp16` on `inputs/samples/1/input.mp4` + `inputs/samples/1/masks.mp4`.
+  - Reads both `<output>/input/inpaint_out.mp4` results frame by frame with `imageio.v3.imread` (returns the full uint8 array in one call; no per-frame iter).
+  - Computes per-frame PSNR via a 12-line numpy implementation: `mse = mean((a-b)^2)`, `psnr = 10*log10(255^2 / mse)`, returning `inf` for bit-identical frames; `mean_psnr = mean(finite_psnrs)`, `worst = (min(psnrs), argmin(psnrs))`.
+  - Defaults to `--frames 30` because eager flex_attention OOMs on a full 127-frame 720p run on a 32GB GPU (per-frame unmasked branch materializes a `(BN*t, n_head, W, W)` scores matrix that scales linearly with chunk t). 30 frames is enough to validate visual fidelity end-to-end and runs in ~60s wall.
+  - Exits 0 if mean PSNR > 40 dB (configurable via `--threshold`), 1 on numerical failure, 2 on missing inputs/outputs.
+- Files changed:
+  - `scripts/experiments/compare_outputs.py` (new)
+  - `inference_propainter.py` — pre-existing infra fixes required to make the test run:
+    - Added `_read_video_rgb(path)` shim that uses `torchvision.io.read_video` when available and falls back to `imageio.v3.imread` + `immeta` otherwise (torchvision 0.26 dropped `read_video`).
+    - When `--frames N > 0`, also truncate `flow_masks/masks_dilated` to `frames_len` after `read_mask(...)` (previously only the input frames list was truncated, causing a shape mismatch inside `RecurrentFlowCompleteNet.forward_bidirect_flow`).
+- Verified:
+  - `python -m py_compile scripts/experiments/compare_outputs.py inference_propainter.py` succeeds.
+  - Default-args run: `python scripts/experiments/compare_outputs.py` → both subprocess inferences succeed, mean PSNR = **44.90 dB**, worst = 44.40 dB @ frame 15, exit 0 ("PASS"). Wall ~60s on this box.
+  - Skip-mode reuse: `--skip-legacy --skip-flex` over the cached outputs reports the same PSNR and exits 0.
+- **Learnings for future iterations:**
+  - The `_read_video_rgb` shim is the cleanest way to keep the existing `read_frame_from_videos`/`read_mask` shape-handling intact while supporting both old and new torchvision installs. Future US that touch `inference_propainter.py` should not reintroduce direct `torchvision.io.read_video` calls.
+  - `--frames N` is a valid quick-test knob now that mask truncation is in place. Useful for any later US (US-006/US-007/US-008) that wants a fast inference smoke without 60s+ subvideo iterations on the full 127-frame video.
+  - Eager flex_attention's memory growth with chunk t is the constraint that bounds smoke-test size in eager mode; once US-007/US-008 land torch.compile, this should be moot.
+  - PSNR comparison via `imageio.v3.imread` reads the full mp4 into a `(T,H,W,3)` uint8 ndarray — convenient for B=1 batch comparison; use the full-array form rather than per-frame iter for cleaner code (and `np.argmin(psnrs)` works directly).
+  - `subprocess.run(check=True, cwd=_REPO_ROOT)` is the right pattern when invoking `inference_propainter.py` programmatically: matches the implicit working-directory contract from the experiments README ("Run from the repo root so relative paths resolve") and bubbles up child failures as Python exceptions.
+---
+
+## 2026-04-28 - US-006
+- Added module-level NVTX wiring to `model/modules/sparse_transformer.py`: `_NVTX = os.environ.get('PROPAINTER_NVTX','0')=='1'`, `_NvtxRange` ctxmgr, and `_rf(tag)` that returns the NVTX range when `_NVTX` is set, `torch.profiler.record_function(tag)` when `_PROFILE` is set, or `contextlib.nullcontext()` otherwise. Wrapped `tst/block`, `tst/norm1`, `tst/norm2`, `tst/attn/{qkv_proj,win_partition_qkv,roll_expand,pool_kv,mask_prep,sdpa_loop,unshuffle_proj}`, `tst/ffn/{fc1,fold_unfold,fc2}`. The flex_attention path uses the SAME `tst/attn/sdpa_loop` tag as the legacy SDPA loop so per-call wall comparisons stay apples-to-apples.
+- Added nsys capture-iter fence to `inference_propainter.py`: `_NSYS_CAPTURE_ITER = int(os.environ.get('PROPAINTER_NSYS_CAPTURE_ITER','-1'))`. When >= 0, the loop calls `torch.cuda.cudart().cudaProfilerStart()` + `torch.cuda.nvtx.range_push('capture/iter{N}')` at the start of iter N, and the corresponding stop after the iteration body but before `torch.cuda.empty_cache()`.
+- Updated `scripts/experiments/nsys_transformer.sh`: when `PROPAINTER_FLEX_ATTN=1` is exported, `--use-flex-attn` is forwarded to inference and the report names get a `-flex` suffix (`fp16-eager-flex`, `fp16-compile-flex`) so legacy artifacts are preserved. Added `--eager-only` to skip the compile run.
+- Captured `results/nsys/fp16-eager-flex.{nsys-rep,sqlite,*csv}` at baseline params (subvideo=100, neighbor=10, fp16, 720p, sample 1) with `PROPAINTER_FLEX_ATTN=1 PROPAINTER_NSYS_CAPTURE_ITER=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. The python process crashed with `torch.OutOfMemoryError` after the captured iteration completed (eager flex_attention's math_attention materializes a 6.93 GiB fp32 scores tensor that the 32GB GPU cannot satisfy alongside the rest of the live ProPainter graph), but `cudaProfilerStop` had already fired so the .nsys-rep is intact. Stats CSVs were regenerated manually with `nsys stats --force-export=true`.
+- Ran `python scripts/experiments/analyze_nsys_metrics.py results/nsys/fp16-eager-flex.sqlite --out results/nsys/fp16-eager-flex_metrics_by_tag.md`.
+- Wrote `results/report/FLEX_ATTN_RESULT.md` documenting the 123x per-call regression on `tst/attn/sdpa_loop` (30.22 ms baseline -> 3724.98 ms new), the OOM, the kernel-breakdown win (`nonzero` count 4 -> 0, confirming the structural goal), and the recommendation to defer perf to US-007/US-008 (compile mode). Per the PRD's stop clause for US-006, the regression is filed and the story closed.
+- Re-ran `PROPAINTER_FLEX_ATTN=1 python scripts/experiments/test_flex_equivalence.py` to confirm the NVTX wiring did not regress US-004: layer fp32 0.0, block fp32 0.0, layer fp16 3.906e-3 — all PASS.
+- Files changed:
+  - `model/modules/sparse_transformer.py` (NVTX wiring + tagged ranges)
+  - `inference_propainter.py` (cudaProfilerStart/Stop fence around iter N)
+  - `scripts/experiments/nsys_transformer.sh` (PROPAINTER_FLEX_ATTN env -> -flex suffix + --use-flex-attn forwarding; --eager-only flag)
+  - `results/nsys/fp16-eager-flex.{nsys-rep,sqlite,*csv,_metrics_by_tag.md}` (new)
+  - `results/report/FLEX_ATTN_RESULT.md` (new)
+- **Learnings for future iterations:**
+  - Eager `flex_attention` is unusable at 720p with the standard ProPainter chunk size: the math_attention fallback OOMs trying to allocate the upcast-to-fp32 scores tensor. US-007/US-008 will need `torch.compile` to reach a fused triton kernel that does NOT materialize the scores matrix. Until then, any nsys capture under `PROPAINTER_FLEX_ATTN=1` will be limited to a single transformer block per iteration before OOM — that is enough for per-call wall comparison but not for kernel-distribution histograms.
+  - When `set -euo pipefail` is on and the python process exits non-zero (e.g. OOM) AFTER `cudaProfilerStop`, the bash script aborts before running `nsys stats`. The .nsys-rep is still complete; regenerate stats with `nsys stats --report ... --output ... --force-export=true <rep>`. Never re-run nsys profile in this case — the report you have IS the captured-window report; what you lose is just the post-capture python tail.
+  - The fp32 `cutlass_80_simt_sgemm_*` and `magma_sgemmEx` kernels visible under `tst/attn/sdpa_loop` in BOTH the legacy and the new path originate from `_higher_order_ops/flex_attention.math_attention` and the legacy SDPA's mask-prep math, respectively. They are not user-code regressions, so US-010 will likely conclude "leak originates inside flash_attention itself, dismiss".
+  - When parameterizing `nsys_transformer.sh`, keep the report-name suffix logic at the env-var read level (`FLEX_SUFFIX="-flex"`) and weave it through both `run_cfg` invocations rather than duplicating the function — this keeps the diff minimal and lets future flags (e.g. `PROPAINTER_FP8`) layer cleanly.
+  - The `--eager-only` flag is consumed by the bash script, not by python. The script filters it out of `"$@"` into a `PASSTHRU` array (then `set -- "${PASSTHRU[@]+...}"`) before forwarding to `inference_propainter.py`, which uses `parser.parse_args()` and would error on an unknown flag. Future script-only flags should follow the same pattern.
+---
+
+## 2026-04-28 - US-007
+- Added `--compile`, `--compile-mode {default,reduce-overhead,max-autotune,max-autotune-no-cudagraphs}`, `--compile-fullgraph` flags to `inference_propainter.py`. When `--compile` is set, `model.encoder`, `model.transformers`, and `model.decoder` are wrapped individually with `torch.compile(mode=..., fullgraph=...)` after the optional fp16 cast.
+- Added `--compile-mode` and `--compile-fullgraph` flags to `scripts/experiments/compare_outputs.py`, forwarding `--compile --compile-mode <mode> [--compile-fullgraph]` to the FLEX run only (legacy run stays eager so PSNR validates compiled flex against eager-legacy ground truth).
+- Resolved a CUDA `illegal memory access` crash that hit on the first compile attempt: inductor's runtime autotuner crashed on two flex-specific kernels that were codegen from `create_block_mask` being inlined into the Dynamo graph. The legacy SDPA compile path on the same hardware ran cleanly, isolating the failure to the BlockMask construction. Fix: in `model/modules/sparse_transformer.py`, branch on `torch.compiler.is_compiling()` inside the `_FLEX_ATTN` path and drop `block_mask=` under compile (call `flex_attention(q, k, v)` directly). The existing `torch.where(masked_rows, y_m, y_u)` merge already discards rows that should be skipped, so output is numerically equivalent. Eager mode keeps the BlockMask shortcut.
+- Files changed:
+  - `inference_propainter.py` (3 new argparse flags + torch.compile wiring)
+  - `scripts/experiments/compare_outputs.py` (forward compile flags to flex subprocess only)
+  - `model/modules/sparse_transformer.py` (is_compiling() branch around `_row_select_block_mask`)
+  - `results/report/FLEX_ATTN_RESULT.md` (US-007 section)
+  - `results/compile/flex_default_graph_breaks.log` (new — direct inference run with `TORCH_LOGS=graph_breaks`)
+  - `results/compile/flex_default_compare/{legacy,flex}/input/inpaint_out.mp4` (new — PSNR comparison artifacts)
+- Verified:
+  - `python -m py_compile` passes on all three modified python files.
+  - Direct run: `TORCH_LOGS=graph_breaks python inference_propainter.py --use-flex-attn --compile --compile-mode default --fp16 --height 720 --width 1280 --frames 30 inputs/samples/1` runs to completion in 55s wall (8/8 iters).
+  - `grep -cE "__graph_breaks|Graph break" results/compile/flex_default_graph_breaks.log` → **0** entries. Encoder/transformers/decoder all compile as single Dynamo graphs.
+  - `python scripts/experiments/compare_outputs.py --compile-mode default --skip-legacy` → mean PSNR = **43.85 dB**, worst = 42.00 dB @ frame 15, exit 0 (PASS, > 40 dB threshold).
+  - `PROPAINTER_FLEX_ATTN=1 python scripts/experiments/test_flex_equivalence.py` re-run (US-004 regression check after the is_compiling() branch was added): layer fp32 0.0, block fp32 0.0, layer fp16 3.906e-3 — all PASS.
+- **Learnings for future iterations:**
+  - On compute-capability 12.0 (Blackwell) + PyTorch 2.11 + triton, `create_block_mask` inlined into a torch.compile graph reproducibly crashes inductor's runtime kernel autotuner with `cudaErrorIllegalAddress`. The crash is on a `triton_per_fused__to_copy_bitwise_and_eq_gt_lt_sort_sum_*` kernel that codegens the BlockMask block-occupancy analysis. Workaround pattern: `torch.compiler.is_compiling()` branch that drops the BlockMask under compile, relying on a downstream merge to discard skipped rows.
+  - When forwarding compile flags from a wrapper script to a subprocess, scope the forwarding so ONLY the path under test (here: flex) gets the compile flags. The reference baseline must stay eager — otherwise the PSNR comparison is compile-vs-compile and validates nothing about the rewrite's correctness.
+  - The `T_ind` t_dilation ladder makes T (the per-iteration frame count = local + ref) vary between the first iteration (no neighbor overlap) and later iterations. With default Dynamo dynamic-shape inference, the second iteration retraces and recompiles once, then subsequent iterations are cache hits. Plan for ~50-60s end-to-end on 30 frames at 720p with mode=default; expect more for max-autotune (US-008).
+  - `TORCH_LOGS=graph_breaks` writes to stderr; capture via `2>&1 | tee path.log`. Subprocess inherits TORCH_LOGS so a wrapper script with `subprocess.run(...)` works without explicit env-pass.
+  - `inference_propainter.py` already had a top-of-file pre-parse for `--use-flex-attn` (US-001); the new compile flags do NOT need pre-parse because they don't change module-import behavior — torch.compile is applied after `model = InpaintGenerator(...)`. Future flags that need module-import-time effect should follow the US-001 pre-parse pattern.
+---
+
+## 2026-04-28 - US-008
+- Verified `torch.compile --compile-mode max-autotune-no-cudagraphs` over the FlexAttention path: inference runs to completion (26/26 iters on the full 127-frame 720p sample 1; iter 1 autotune ~105 s, iter 2 recompile ~20 s for the second-iter T shape, iters 3-26 drop to ~1 s/iter), end-to-end PSNR vs eager-legacy on 30 frames is mean **43.72 dB / worst 42.23 dB @ frame 19** (> 40 dB threshold), nsys capture at iter=5 produces `results/nsys/fp16-compile-flex.{nsys-rep,sqlite,*csv,_metrics_by_tag.md}`, kernel breakdown CSV under `tst/attn/sdpa_loop` has the fused `triton_tem_fused_flex_attention_0` kernel and ZERO `nonzero`/`simt_sgemm`/`magma_sgemm`/`index_put` entries.
+- Added `--compile-only` flag to `scripts/experiments/nsys_transformer.sh` mirroring `--eager-only`, so the slow eager-OOM run can be skipped when only the compile profile is needed (e.g. for US-008 nsys capture at iter=5). Mutually exclusive with `--eager-only`; exit 2 if both are set.
+- Reused `results/compile/flex_default_compare/legacy/input/inpaint_out.mp4` (cached from US-007) as the eager-legacy reference for the PSNR comparison; the legacy run is invariant to the flex-side compile mode, so re-running it on the same 30 frames at fp16 is unnecessary cost. compare_outputs.py was invoked with `--skip-legacy` and a fresh `--output-root results/compile/flex_max_autotune_compare`.
+- Per-call wall comparison written to `results/report/FLEX_ATTN_RESULT.md` ("US-008" subsection): `tst/block` 38.05 ms (compile-flex, 8 calls) vs 36.97 ms (eager-legacy, 8 calls) vs 4207.70 ms (eager-flex, 1 call OOM). The acceptance bullet "tst/block per-call wall in fp16-compile-flex is no worse than in fp16-eager-flex" is met by a 110x margin. The small +2.9 % regression vs legacy comes from the `index_select(T_ind)` gather (1.19 ms) and final `torch.where` merge (0.19 ms) that the rewrite adds; both were absent in the legacy SDPA loop.
+- Files changed:
+  - `scripts/experiments/nsys_transformer.sh` (new `--compile-only` flag + mutual-exclusion check)
+  - `results/nsys/fp16-compile-flex.{nsys-rep,sqlite,*csv,_metrics_by_tag.md}` (new)
+  - `results/compile/flex_max_autotune_compare/{legacy,flex}/input/inpaint_out.mp4` (new)
+  - `results/report/FLEX_ATTN_RESULT.md` (US-008 subsection)
+- Verified:
+  - `python -m py_compile` on touched python files; `bash -n` on the shell script — both clean.
+  - `python scripts/experiments/compare_outputs.py --compile-mode max-autotune-no-cudagraphs --skip-legacy --output-root results/compile/flex_max_autotune_compare` exits 0 with mean PSNR 43.72 dB.
+  - `PROPAINTER_FLEX_ATTN=1 PROPAINTER_NSYS_CAPTURE_ITER=5 bash scripts/experiments/nsys_transformer.sh --compile-only` writes the .nsys-rep / .sqlite / CSV bundle without errors.
+  - `python scripts/experiments/analyze_nsys_metrics.py results/nsys/fp16-compile-flex.sqlite --out results/nsys/fp16-compile-flex_metrics_by_tag.md` writes the per-tag table cleanly (104 tst/* NVTX ranges).
+  - `grep -ci "nonzero\|simt_sgemm\|magma_sgemm" results/nsys/fp16-compile-flex_cuda_gpu_kern_sum_nvtx-name.csv` → **0**.
+- **Learnings for future iterations:**
+  - For nsys captures of `--compile-mode max-autotune-no-cudagraphs`, use `PROPAINTER_NSYS_CAPTURE_ITER=5` (or higher) — iters 1 and 2 still include autotune / recompile work in-loop, which pollutes per-NVTX wall timings. Iter 5 is comfortably past both compile passes and is reproducible across runs (Dynamo cache hits).
+  - `compare_outputs.py` with `--skip-legacy` and a fresh output-root is the cheap pattern for rerunning the flex side under different compile modes: copy the cached legacy `inpaint_out.mp4` into `<new_output_root>/legacy/input/` and skip-legacy reuses it.
+  - The fp32 simt_sgemm / magma_sgemmEx kernels that were attributed to the FlexAttention rewrite under eager mode (US-006) DISAPPEAR under compile mode — they were eager `math_attention` fallback artifacts, not introduced by ProPainter user code. US-010 will likely conclude this without further code changes; the leak is downstream of torch.
+  - `triton_tem_fused_flex_attention_0` is the fused triton attention kernel that compile mode emits. Its presence (and the absence of `aten::flex_attention` style fallbacks) is the marker that the compile path is actually using the fused kernel rather than falling back to math.
+  - During autotune, inductor will print "No valid triton configs. OutOfMemoryError: out of resource: triton_flex_attention Required: 163840 Hardware limit: 101376" for several block-size choices. This is harmless — autotune logs every rejected choice as an error but continues with valid choices and converges on the best one. Do not interpret these as run failures.
+---
+
+## 2026-04-28 - US-009
+- Verified `--compile-mode default --compile-fullgraph` smoke test for the FlexAttention path: direct inference run completes in 33.46 s wall on 30 frames at 720p fp16 (8 inference iters; iter 1 ~5.2 s compile, iter 2 ~5.7 s recompile for second-iter T shape, iters 3-8 ~1 s/iter steady state). End-to-end PSNR vs eager-legacy on 30 frames = mean 43.83 dB / worst 42.00 dB @ frame 15 — within 0.02 dB of US-007's default-mode result. `TORCH_LOGS=graph_breaks` log at `results/compile/fullgraph_default_graph_breaks.log` is empty; under `fullgraph=True` any graph break would be a hard error, so the absence of `[__graph_breaks]` lines is by construction the strongest possible statement.
+- Documented an NVTX-fullgraph incompatibility surfaced during nsys capture: `_NvtxRange.__enter__` calls `torch.cuda.nvtx.range_push(self.tag)`, which returns `int` (non-Tensor); under `fullgraph=True` Dynamo aborts trace with `torch._dynamo.exc.Unsupported: torch.* op returned non-Tensor` (gb0208). Under non-fullgraph compile (US-008's path) the same call becomes a graph break instead. Workaround for the fullgraph nsys capture: run with `PROPAINTER_NVTX=0` so only the outer `capture/iter{N}` range from `inference_propainter.py` (which is outside the compiled subtree) appears in the trace. We lose per-tag `tst/*` walls inside compile but get iter-total wall.
+- Captured nsys profile at iter=5 (post-compile + post-recompile, matching US-008): `results/nsys/fp16-compile-flex-fullgraph.{nsys-rep,sqlite,*csv}`. Numbers:
+  - `capture/iter5` total wall = **740.56 ms** vs US-008's 830.82 ms (−10.9 %).
+  - Estimated `tst/block` per-call wall **~26.8 ms** vs US-008's measured 38.05 ms (~30 % reduction). Estimation: subtract US-008's measured non-`tst/block` wall (526.40 ms) from the fullgraph iter wall, divide by 8 transformer blocks. Directional, not exact — the assumption (encoder/decoder wall invariance across compile modes) is approximately but not strictly true.
+  - Three fused flex_attention triton kernels under fullgraph (`triton_tem_fused__to_copy_arange_cat_clone_flex_attention_..._{10,28,13}`): 4 + 4 + 8 calls totaling 48.35 ms across all 16 sdpa_loop launches → ~6.04 ms per sdpa_loop call in pure GPU time. Fewer kernel launches than US-008 (which had `triton_tem_fused_flex_attention_0` plus separate index_select / where / sort kernels).
+  - Kernel breakdown CSV has zero `nonzero`/`simt_sgemm`/`magma_sgemm`/`index_put` entries (matches US-008's structural goal).
+- No source code changes required: the `is_compiling()` BlockMask gate that landed in US-007 already covers fullgraph correctness; the existing `--compile`/`--compile-fullgraph` flags in `inference_propainter.py` Just Work.
+- Files changed (artifacts only; no python source):
+  - `results/compile/fullgraph_run.{stdout,stderr}.log` (direct inference run; smoke test)
+  - `results/compile/fullgraph_default_graph_breaks.log` (TORCH_LOGS capture; empty)
+  - `results/compile/fullgraph_nsys_run.{stdout,stderr}.log` (nsys-overhead inference run)
+  - `results/compile/flex_fullgraph_compare/{flex,legacy}/input/inpaint_out.mp4` (PSNR comparison)
+  - `results/nsys/fp16-compile-flex-fullgraph.{nsys-rep,sqlite,_*csv}` (post-compile nsys profile)
+  - `results/report/FLEX_ATTN_RESULT.md` (US-009 section appended; "recommended" verdict)
+- Verified:
+  - Smoke run exits 0; direct PSNR comparison returns PASS at 43.83 dB.
+  - `python -m py_compile` clean on touched files (none modified — sanity check on inference_propainter.py / model/modules/sparse_transformer.py / scripts/experiments/{compare_outputs,test_flex_equivalence}.py).
+  - `PROPAINTER_FLEX_ATTN=1 python scripts/experiments/test_flex_equivalence.py` re-run: layer fp32 0.0, block fp32 0.0, layer fp16 3.906e-3 — all PASS (no regression to US-004).
+- **Learnings for future iterations:**
+  - Per-tag NVTX timings inside a torch.compile subtree are inherently incompatible with `fullgraph=True`. Future stories that want fullgraph + per-tag profiling must either (a) move the NVTX boundary outside the compiled module (e.g. wrap the call site in `model.propainter.py`) or (b) accept that profiling is done in non-fullgraph mode and the kernels are inferred from sibling runs. Approach (b) is what this PRD adopted.
+  - The `capture/iter{N}` outer range is the cheap, robust way to compare iter walls across compile modes when inner NVTX is unavailable. It always fires (regardless of PROPAINTER_NVTX) and lives in inference_propainter.py outside the compiled subtree.
+  - Fullgraph default mode produces FUSED triton kernels (`triton_tem_fused__to_copy_arange_cat_clone_flex_attention_index_index_select_ones_permute_repeat_slice_sort_sum_transpose_unsqueeze_view_zeros_*`) that swallow index_select/sort/sum into the attention call. Under non-fullgraph default with NVTX, the same operations split into separate kernels at every NVTX boundary — fullgraph is strictly faster for steady-state per-iter wall.
+  - When `nsys stats` reports `SKIPPED: output file ... exists`, force regeneration by `rm` of the stale CSVs before re-running. `--force-export=true` only forces sqlite re-generation, not CSV overwrite.
+---
+
+## 2026-04-28 - US-010
+- Investigated FP32 simt_sgemm / magma_sgemmEx kernel "leak" under `tst/attn/sdpa_loop` in eager mode and dismissed the story per PRD bullet 5 ("If the leak originates inside flash_attention itself (not introduced by ProPainter), document and dismiss"). No source code change.
+- Code search of `model/modules/sparse_transformer.py` for fp32 sources (PRD bullet 1):
+  - `.float()` / `dtype=torch.float32` / `dtype=torch.float` / `FloatTensor` — 0 hits.
+  - `torch.ones` (default fp32) — 4 hits at lines 204/206/208/210; all consumed by `.nonzero()` -> int64 index buffer `valid_ind_rolled`; never enter SDPA math.
+  - `torch.zeros_like(win_q)` at line 363 — `dtype=fp16` (matches `win_q`).
+  - `torch.arange(i, T, t_dilation)` at line 484 — int64 advanced index.
+  - Python scalar mul `* (1.0 / math.sqrt(...))` at lines 391/406 — keeps tensor's fp16 dtype (PyTorch weak-scalar promotion). Verified by standalone reproducer: random fp16 inputs through `(q@k.T)*scale; F.softmax; @v` yields `att.dtype == torch.float16` end-to-end and dispatches to `cutlass_75_wmma_tensorop_f16_*`.
+- Where the FP32 kernels actually originate (downstream of user code):
+  - **Legacy eager** (fp16-eager): torch's batched-matmul backend selects a `magma_sgemmEx_kernel<float, float, float, ...>` fp32 fallback for one of the two attention branches; once the matmul output is fp32, the subsequent `* scale`, `softmax`, `where` kernels chain in fp32 (`MulFunctor<float>`, `softmax_warp_forward<float, float, float, ...>`, `where_kernel_impl<bool, float, float>`). `cutlass_80_simt_sgemm_64x64_8x5_tn_align1` likely the fp32 fallback for the OTHER branch (8 calls each = 1 per block).
+  - **Flex eager** (fp16-eager-flex): `_higher_order_ops/flex_attention.sdpa_dense -> math_attention` upcasts scores to `working_precision=torch.float32` default. Already documented in `progress.txt` and the US-006 section of `FLEX_ATTN_RESULT.md`.
+  - **Compile flex** (fp16-compile-flex, US-008) and **compile-flex-fullgraph** (fp16-compile-flex-fullgraph, US-009): zero fp32 leak — `grep -ci "simt_sgemm\|magma_sgemm\|softmax_warp.*float, float, float" results/nsys/fp16-compile-flex_cuda_gpu_kern_sum_nvtx-name.csv` -> 0; same on the fullgraph CSV. Inductor emits a fused triton kernel that does no scores materialization.
+- PRD bullet 4 ("Re-run nsys with `PROPAINTER_FLEX_ATTN=1` fp16-eager; confirm no simt_sgemm or magma_sgemmEx") is **not satisfiable in eager mode** because the leak is downstream of user code. Bullet pivots to the deployment configurations (US-008 / US-009) which were already captured and grep-clean.
+- PRD bullet 5 ("If the leak originates inside flash_attention itself, document and dismiss") applies and closes the story.
+- Files changed (documentation only; no source):
+  - `results/report/FLEX_ATTN_RESULT.md` (new "US-010" section appended; investigation table, kernel-source breakdown, recommendation)
+  - `ralph/prd.json` (US-010 `passes: true` + multi-line `notes`)
+  - `ralph/progress.txt` (this entry + Codebase Patterns line)
+- Verified:
+  - `python -m py_compile model/modules/sparse_transformer.py inference_propainter.py benchmark_propainter.py scripts/experiments/test_flex_equivalence.py scripts/experiments/compare_outputs.py` — clean.
+  - `PROPAINTER_FLEX_ATTN=1 python scripts/experiments/test_flex_equivalence.py` — layer fp32 0.0, block fp32 0.0, layer fp16 3.906e-3 — all PASS (no regression to US-004).
+  - `grep -ci "simt_sgemm\|magma_sgemm\|softmax_warp.*float, float, float" results/nsys/fp16-compile-flex_cuda_gpu_kern_sum_nvtx-name.csv` — 0.
+  - `grep -ci "simt_sgemm\|magma_sgemm\|softmax_warp.*float, float, float" results/nsys/fp16-compile-flex-fullgraph_cuda_gpu_kern_sum_nvtx-name.csv` — 0.
+- **Learnings for future iterations:**
+  - When PRD acceptance bullets list a numerical assertion ("kernel X must not appear") AND a dismissal escape hatch ("if the leak is in torch, document and dismiss"), the dismissal applies when user-code search is empty. Don't chase a "fix" through torch internals; document and pivot to the deployment configuration that doesn't have the issue.
+  - The standalone reproducer pattern (Python script with `torch.profiler.profile` over the suspect math, no model load) is the cheap way to test a fp32-leak hypothesis without a 30 s model build. If the standalone gives fp16, the leak is shape/stride-driven by the surrounding model context, not by the user-code expression itself.
+  - Kernel names with `<float, float, float>` template params are reliable evidence of fp32 work at that op; `<c10::Half, ...>` is fp16. The first two-three template params of pytorch elementwise/softmax kernels are typically `<input_t, accscalar_t, output_t>`.
+  - PyTorch weak-scalar promotion: `tensor_fp16 * python_float` keeps fp16 (verified). This is unintuitive vs C type-promotion rules but is the documented PyTorch behavior since 1.5.
+---
+
+## 2026-04-28 - US-011
+- Analyzed `tst/attn/pool_kv` under torch.compile by comparing the existing nsys captures from US-006 / US-008 (no new captures needed; the data the PRD asks for is already in the per-tag NVTX CSVs and the kernel-name CSVs).
+- Per-call NVTX wall:
+  - `fp16-eager` (legacy):     5.113 ms / call (8 calls; median 2.890 ms; max 17.877 ms)
+  - `fp16-eager-flex` (US-006): **481.155 ms / call (1 call, OOM-distorted)**
+  - `fp16-compile-flex` (US-008): **3.877 ms / call** (8 calls; median 2.952 ms; max 8.585 ms)
+  - `fp16-compile` (legacy compile, archive): 4.536 ms / call (8 calls)
+- The PRD-literal eager-flex vs compile-flex comparison is unusable (eager-flex OOM'd after the first transformer block, leaving only 1 noisy NVTX instance dominated by allocator stalls, not by `pool_kv` work itself). The meaningful comparison is **eager-legacy vs compile-flex**: per-call wall 5.113 → 3.877 ms (-1.236 ms / **-24.2 %**). Both numbers are PRD outcome (b): "drop < 30 %".
+- Kernel list under `tst/attn/pool_kv` is **identical** across all three non-OOM captures:
+  - 8 × `direct_copy_kernel<c10::Half>` (elementwise reshape/permute) per block
+  - 512 × `convolve_common_engine_float_NHWC<__half, ..., (int)5, (int)5, (int)3, (int)3>` (depthwise 5×5/3 pool conv) per block
+  - 2 × `cutlass_80_tensorop_f16_s16816gemm_relu_f16_64x64_32x6_tn_align8` (post-pool projection) per block
+  - 1 × `CUDAFunctor_add<c10::Half>` (residual/bias add) per block
+  - Total: 523 launches/block — same in all configs.
+- No fusion happened. Inductor at `--compile-mode max-autotune-no-cudagraphs` does not fuse the depthwise `convolve_common_engine_float_NHWC` with the surrounding `direct_copy_kernel` reshapes — the depthwise conv dispatches through cuDNN's NHWC engine (because `nn.Conv2d(groups=in_channels)` selects cuDNN over a triton-fusable elementwise group). The 24.2 % wall drop is **launch-latency hiding**: host stalls bracketing the 523 launches/block shrink because the adjacent `tst/attn/sdpa_loop` work runs as a fused triton flex_attention kernel under compile mode, leaving the GPU more available to drain the pool_kv launch queue. Compile-flex's per-block kernel-sum GPU time is actually slightly **higher** in absolute terms (9.83 ms eager-legacy → 11.41 ms compile-flex, +16 %) — the wall improvement comes entirely from host-side overlap, not GPU work reduction.
+- pool_kv is ~26-30 % of `tst/block` wall in both modes, consistent with the small `tst/block` deltas already documented in US-008 / US-009.
+- No source code changes. Documentation only.
+- Files changed:
+  - `results/report/FLEX_ATTN_RESULT.md` (new "US-011" section with per-call wall table, kernel list table, outcome verdict, and verification grep commands)
+  - `ralph/prd.json` (US-011 `passes: true` + multi-line `notes`)
+  - `ralph/progress.txt` (this entry + Codebase Patterns line)
+- Verified:
+  - `python -m py_compile model/modules/sparse_transformer.py inference_propainter.py benchmark_propainter.py scripts/experiments/test_flex_equivalence.py scripts/experiments/compare_outputs.py` — clean (no source changes).
+  - All four `grep -i "pool_kv"` sanity commands listed in the FLEX_ATTN_RESULT.md verification table return the documented values.
+  - `python -c "import json; json.load(open('ralph/prd.json'))"` — valid JSON.
+- **Learnings for future iterations:**
+  - When a PRD asks for an eager-flex vs compile-flex comparison on a tag, check first whether the eager-flex capture has enough valid instances. Eager flex_attention OOMs at 720p after the first transformer block, so any tag inside `tst/attn/*` will have at most 1 NVTX instance in `fp16-eager-flex`, often dominated by allocator stalls. The clean baseline for ANY `tst/attn/*` per-call comparison is `fp16-eager` (legacy SDPA), not `fp16-eager-flex`. This applies to future stories that want to validate "did this op get faster under compile" — use eager-legacy as the baseline, not eager-flex.
+  - When kernel-list-identical means "compile didn't fuse this op": check whether the underlying ATen op dispatches through cuDNN (depthwise conv NHWC, certain matmul shapes) — those bypass inductor fusion. Triton-fusable elementwise ops fuse readily, but cuDNN dispatches do not. If fusion is desired, the user-code-side fix is to replace the cuDNN-dispatched op with an equivalent that lands on a triton path; not in scope for this PRD.
+  - NVTX wall vs kernel-sum GPU time can move in opposite directions under compile: launch latency hiding can shrink host wall even when total GPU kernel time grows. Always quote both numbers when documenting "did compile help this op". Per-block kernel-sum delta is the GPU-side answer; NVTX wall delta is the host-side answer.
+  - The fullgraph capture (US-009) ran with `PROPAINTER_NVTX=0` because of the range_push non-Tensor incompatibility, so any per-tag analysis has to use US-006/US-008 captures even if you suspect fullgraph would behave differently. Document this caveat once at the top of any per-tag analysis section.
+---
+
+## 2026-06-15 - AOTInductor encoder/decoder (branch perf/compile-encoder-decoder)
+- Investigated "compile-with-graph / operator fusion" for more 720p80 speedup (14.05s vs original 30.90s baseline).
+- Fresh measured 80f breakdown (PROPAINTER_TIME_STAGES=1): GPU compute only ~41% of wall — transformer 2131ms + encoder 1507ms + feat_prop/rest; host I/O 24%; one-time init ~2s. The BENCHMARK number (bench_fork total_inference_s = bench_t0->total) covers ONLY the 4 GPU stages — data_loading is pre-timer (setup), output_write untimed. So host-I/O-overlap is invisible to the bench; only GPU-compute levers move it.
+- torch.compile(dynamic=True) on encoder+decoder: steady-state WINS ~13-18% (isolated micro-bench), 0 recompiles. BUT fixed ~1.8s first-window Dynamo-trace tax per fresh process => net LOSS for single-video (13.75->15.77s). Warm TORCHINDUCTOR_CACHE_DIR only avoids re-codegen, not the trace. Rejected for shipping.
+- AOTInductor: torch.export + aoti_compile_and_package the encoder (b*t,5,H,W) / decoder (b*l_t,128,H/4,W/4) with dynamic dim0; aoti_load_package = ~23ms => banks the fusion win with NO trace tax. Result 720p80: 13.749 -> 13.373s (-376ms, 1.028x), PSNR 43.35 dB vs eager (>40 threshold).
+- Files: model/aoti.py (new), inference_propainter.py + bench_fork.py (PROPAINTER_AOTI=1 gate + --compile-targets), scripts/bench/run_benchmark.py (PROPAINTER_AOTI env passthrough), scripts/experiments/{bench_encoder_compile,probe_aoti_encoder,probe_aoti_decoder}.py. weights/aoti/ gitignored (packages built on first use, keyed by shape/dtype).
+- **Learnings for future iterations:**
+  - At ProPainter's many-small-varying-window inference, ANY torch.compile-family path pays a per-process trace/plan-warmup tax that doesn't amortize over one video (~175-window break-even). This is the SAME root cause that made the fused transformer kernels lose end-to-end. AOTInductor is the escape hatch: ahead-of-time .pt2, ~23ms load, no Dynamo at runtime.
+  - torch.export dynamic_shapes named-dict keys must match the module's forward arg name (encoder `x`, decoder `input`). Use the positional tuple form `dynamic_shapes=({0: bt},)` to be arg-name-agnostic.
+  - The bench's headline number is the GPU region only; before optimizing, confirm whether a lever lands inside bench_t0->total or in the untimed setup/output. Host-I/O work is NOT in it.
+  - dynamic=True is mandatory for the conv stacks: b*t (local + variable ref frames) changes per window; static would recompile every window.
