@@ -334,15 +334,26 @@ if __name__ == '__main__':
     parser.add_argument(
         "--ref_stride", type=int, default=10, help='Stride of global reference frames.')
     parser.add_argument(
-        # 10 matches the training setting — keep the default faithful to how the
-        # model was trained rather than tuned for a benchmark shape. For pure
-        # throughput, larger windows help up to a point: measured 720p/200f fp16,
-        # the transformer cost vs window size is a U-curve (TOTAL 22.6s @20, 22.4s
-        # @24, back up to 24.5s @30, OOM @40), and the whole-run memory peak is set
-        # by flow_estimation (~31.4 GB), not the window, for any length <= 30. So a
-        # deployment that prioritizes speed over train-time fidelity can pass
-        # --neighbor_length 24, but the default stays at the trained value.
-        "--neighbor_length", type=int, default=10, help='Length of local neighboring frames.')
+        # 10 matches the training setting — this is the temporal receptive field of
+        # the transformer/feat_prop (window half-width = neighbor_length//2), so
+        # keep it faithful to how the model was trained. To trade speed for fidelity
+        # don't enlarge this (it changes cross-frame semantics); instead enlarge
+        # --window_stride, which keeps the trained window but skips redundant
+        # overlapping windows (measured ~47% off the transformer stage).
+        "--neighbor_length", type=int, default=10, help='Length of local neighboring frames (transformer temporal receptive field).')
+    parser.add_argument(
+        # Loop step for the feat-prop/transformer sliding window, decoupled from the
+        # window size. Original behavior = neighbor_length//2 (windows overlap ~50%).
+        # -1 keeps that. A larger stride runs fewer windows (less recompute of the
+        # same frames) WITHOUT changing each window's trained temporal field, so it
+        # speeds up the transformer stage while preserving cross-frame semantics.
+        # Must be <= neighbor_length (else gaps between windows -> unwritten frames);
+        # the loop also forces a final window flush against the video end so the tail
+        # is always covered. Some overlap (stride < neighbor_length) is kept so the
+        # 0.5-average still blends window seams.
+        "--window_stride", type=int, default=-1,
+        help='Sliding-window step for transformer stage (-1 = neighbor_length//2, the original). '
+             'Larger = faster, fewer windows; must be <= neighbor_length.')
     parser.add_argument(
         "--subvideo_length", type=int, default=60, help='Length of sub-video for long video inference.')
     parser.add_argument(
@@ -668,6 +679,22 @@ if __name__ == '__main__':
     else:
         ref_num = -1
 
+    # Window half-width is the trained temporal field; the loop step is decoupled
+    # (--window_stride) so we can skip redundant overlapping windows without
+    # changing per-window semantics. Default step = neighbor_stride (original).
+    win_step = args.window_stride if args.window_stride > 0 else neighbor_stride
+    win_step = max(1, min(win_step, args.neighbor_length))  # <= neighbor_length: keep >=1-frame overlap, no gaps
+    # Explicit center list so we can guarantee tail coverage: if the last window
+    # [c-half, c+half] doesn't reach the final frame, append one more center placed
+    # so its window ends at video_length-1. Without this, frames past the last
+    # center are never written and read back as uninitialized garbage.
+    window_centers = list(range(0, video_length, win_step))
+    last_covered = (window_centers[-1] + neighbor_stride) if window_centers else -1
+    if last_covered < video_length - 1:
+        tail_center = max(0, video_length - 1 - neighbor_stride)
+        if tail_center != window_centers[-1]:
+            window_centers.append(tail_center)
+
     # GPU-resident compositing (replaces the per-window float D2H + numpy blend).
     # Originals as exact uint8 on device: ori_frames[idx] is HWC uint8 -> CHW uint8.
     # comp_gpu holds the running composite (uint8, CHW); a per-frame write count
@@ -682,7 +709,7 @@ if __name__ == '__main__':
     # ---- feature propagation + transformer ----
     _tick('feat_prop_transformer')
     _nsys_active = False
-    for _it, f in enumerate(tqdm(range(0, video_length, neighbor_stride))):
+    for _it, f in enumerate(tqdm(window_centers)):
         if _NSYS_CAPTURE_ITER >= 0 and _it == _NSYS_CAPTURE_ITER:
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStart()
